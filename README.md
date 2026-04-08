@@ -130,13 +130,14 @@ All six sources should return at least one row and write successfully to the loc
 
 ## Schema overview
 
-Four core tables. Full column definitions are in [`docs/project_reference.md`](docs/project_reference.md).
+1. [`balance_sheet`](#1-balance_sheet) — monthly S&D estimates by vintage
+2. [`prices`](#2-prices) — daily spot and forward cash bids + futures
+3. [`crop_conditions`](#3-crop_conditions) — weekly in-season crop condition ratings
+4. [`cgc_flows`](#4-cgc_flows) — weekly grain movement and elevator stocks
+5. [`scenario_runs`](#5-scenario_runs) — scenario metadata and assumptions log
+6. [`scenario_outputs`](#6-scenario_outputs) — implied balance sheet and basis per scenario
+7. [`sources`](#7-sources) — source registry and ingestion config
 
-| Table | Grain | Primary key |
-|---|---|---|
-| `balance_sheet` | Monthly | `crop_year`, `month`, `source`, `report_date` |
-| `prices` | Daily | `date`, `location`, `contract_month` |
-| `crop_conditions` | Weekly (in-season) | `report_date`, `region`, `crop` |
-| `cgc_flows` | Weekly | `week_ending` |
+- For more details on the schema design and column definitions, see the [project reference document](docs/project_reference.md).
 
 ---
