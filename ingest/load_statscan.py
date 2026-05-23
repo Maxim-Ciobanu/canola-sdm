@@ -13,6 +13,7 @@ geography, crop, report_date).
 """
 
 import csv
+import re
 import sqlite3
 import sys
 from datetime import date
@@ -33,6 +34,11 @@ FIELD_MAP = {
 }
 
 MONTH_MAP = {"Mar": ("March", 3, 31), "Jul": ("July", 7, 31), "Dec": ("December", 12, 31)}
+MONTH_NAME_TO_META = {
+    "march": ("March", 3, 31),
+    "july": ("July", 7, 31),
+    "december": ("December", 12, 31),
+}
 
 
 def clean_label(s):
@@ -41,18 +47,30 @@ def clean_label(s):
 
 
 def label_to_meta(label):
-    """e.g. 'Mar-23' -> ('2022/23', 'March', date(2023, 3, 31))
+    """e.g. 'Mar-23' or 'March 2023' -> ('2022/23', 'March', date(2023, 3, 31))
 
     Per the StatsCan footnote:
       March 20XX = cumulative Aug(X-1) to Mar X  -> crop year (X-1)/X
       July 20XX  = cumulative Aug(X-1) to Jul X  -> crop year (X-1)/X (full year)
       December 20XX = cumulative Aug X to Dec X  -> crop year X/(X+1)
     """
-    mon_abbr, yr2 = label.split("-")
-    yr = 2000 + int(yr2)
-    snap_month, mm, dd = MONTH_MAP[mon_abbr]
+    normalized = label.strip()
+
+    short_match = re.fullmatch(r"(Mar|Jul|Dec)-(\d{2})", normalized)
+    if short_match:
+        mon_abbr, yr_text = short_match.groups()
+        yr = 2000 + int(yr_text)
+        snap_month, mm, dd = MONTH_MAP[mon_abbr]
+    else:
+        long_match = re.fullmatch(r"(March|July|December)\s+(\d{4})", normalized, re.IGNORECASE)
+        if not long_match:
+            raise ValueError(f"Unrecognized snapshot label: {label!r}")
+        month_name, yr_text = long_match.groups()
+        snap_month, mm, dd = MONTH_NAME_TO_META[month_name.lower()]
+        yr = int(yr_text)
+
     snap_date = date(yr, mm, dd)
-    if mon_abbr == "Dec":
+    if snap_month == "December":
         crop_year = f"{yr}/{(yr + 1) % 100:02d}"
     else:
         crop_year = f"{yr - 1}/{yr % 100:02d}"
