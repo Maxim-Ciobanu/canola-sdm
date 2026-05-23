@@ -5,7 +5,8 @@ Reads from data/db/canola.sqlite and displays:
   - Tab 1: StatsCan triannual balance sheet (one row per snapshot)
   - Tab 2: CGC weekly flows (one row per week loaded)
   - Tab 3: Bridge check — CGC CYTD vs StatsCan (only at real anchor weeks)
-  - Tab 4: Findings, gaps, identity validation
+  - Tab 4: Prices (PDQ) — spot cash bids and basis by zone
+  - Tab 5: Findings, gaps, identity validation
 
 Run:
     pip install dearpygui
@@ -27,6 +28,11 @@ COL_BAD    = (220, 80,  80)
 COL_DIM    = (160, 160, 160)
 COL_HDR    = (110, 180, 240)
 COL_INFO   = (180, 180, 200)
+
+# Plot line colours per zone
+COL_SOUTH  = (90,  200, 120)   # green
+COL_NORTH  = (110, 180, 240)   # blue
+COL_PEACE  = (240, 180, 60)    # gold
 
 # Threshold for the bridge check (percent absolute).
 # The +7% structural gap (missing channels: producer cars, feed mills,
@@ -72,6 +78,52 @@ def fetch_cgc():
         ORDER BY week_ending
     """).fetchall()]
     con.close(); return rows
+
+
+def fetch_prices():
+    """Fetch all PDQ price rows. Returns empty list if table doesn't exist."""
+    con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prices'")
+        if not cur.fetchone():
+            con.close()
+            return []
+        rows = [dict(r) for r in con.execute("""
+            SELECT observation_date, zone, delivery_month,
+                   cash_per_bu, cash_change, basis_per_bu, basis_change,
+                   futures_contract
+            FROM prices
+            ORDER BY observation_date, zone
+        """).fetchall()]
+    except Exception:
+        rows = []
+    con.close()
+    return rows
+
+
+def fetch_nowcast():
+    """Fetch computed nowcast rows. Returns empty list if table missing or empty."""
+    con = sqlite3.connect(DB_PATH); con.row_factory = sqlite3.Row
+    try:
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='nowcast'")
+        if not cur.fetchone():
+            con.close()
+            return []
+        rows = [dict(r) for r in con.execute("""
+            SELECT week_ending, crop_year,
+                   total_supplies_kt, deliveries_cytd_kt,
+                   estimated_total_stocks_kt, visible_commercial_stocks_kt,
+                   implied_on_farm_stocks_kt
+            FROM nowcast
+            WHERE geography='Alberta' AND crop='Canola'
+            ORDER BY week_ending
+        """).fetchall()]
+    except Exception:
+        rows = []
+    con.close()
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +182,6 @@ def bridge_compare(cgc_rows, statscan_rows):
         first_anchor_date = anchors[0][0]
         last_anchor_date  = anchors[-1][0]
 
-        # Before first anchor: no honest comparison possible.
-        # Deliveries follow an S-curve (slow Aug, steep Sept-Oct, steady Nov-).
-        # Linear from zero badly under/over-estimates depending on point.
         if wk_end < first_anchor_date:
             results.append(_bridge_result(
                 cgc, None, None, None, "NO ANCHOR YET",
@@ -208,18 +257,72 @@ def bridge_verdict(status, gap_pct):
         return ("NULL", COL_DIM)
     abs_pct = abs(gap_pct)
     if status == "ANCHOR":
-        # At anchor dates expect tight match, missing channels are well-documented +7%
         if abs_pct < THR_TIGHT:
             return ("ANCHOR ✓", COL_GOOD)
         if abs_pct < THR_ACCEPTABLE:
             return ("ANCHOR ~7% (channels)", COL_WARN)
         return ("ANCHOR FAIL", COL_BAD)
-    # INTERIM or POST-ANCHOR
     if abs_pct < THR_TIGHT:
         return ("TIGHT", COL_GOOD)
     if abs_pct < THR_ACCEPTABLE:
         return ("EXPECTED", COL_WARN)
     return ("INVESTIGATE", COL_BAD)
+
+
+# ---------------------------------------------------------------------------
+# Price helpers
+# ---------------------------------------------------------------------------
+
+def prices_by_zone(price_rows):
+    """Group price rows by zone, each sorted by date."""
+    by_zone = {}
+    for r in price_rows:
+        by_zone.setdefault(r["zone"], []).append(r)
+    for z in by_zone:
+        by_zone[z].sort(key=lambda r: r["observation_date"])
+    return by_zone
+
+
+def date_to_float(d_str):
+    """Convert ISO date string to matplotlib-style ordinal float for plotting."""
+    d = datetime.fromisoformat(d_str).date()
+    return d.toordinal()
+
+
+def monthly_avg(rows, field):
+    """Compute monthly averages from daily rows. Returns (labels, values)."""
+    by_month = {}
+    for r in rows:
+        val = r.get(field)
+        if val is None:
+            continue
+        ym = r["observation_date"][:7]  # "2024-01"
+        by_month.setdefault(ym, []).append(val)
+    labels = sorted(by_month.keys())
+    values = [sum(by_month[ym]) / len(by_month[ym]) for ym in labels]
+    return labels, values
+
+
+def price_summary_stats(rows):
+    """Compute summary stats for a list of price rows."""
+    cash_vals = [r["cash_per_bu"] for r in rows if r["cash_per_bu"] is not None]
+    basis_vals = [r["basis_per_bu"] for r in rows if r["basis_per_bu"] is not None]
+    if not cash_vals:
+        return {}
+    return {
+        "n_days": len(cash_vals),
+        "first": rows[0]["observation_date"],
+        "last": rows[-1]["observation_date"],
+        "cash_min": min(cash_vals),
+        "cash_max": max(cash_vals),
+        "cash_avg": sum(cash_vals) / len(cash_vals),
+        "cash_last": cash_vals[-1],
+        "basis_n": len(basis_vals),
+        "basis_min": min(basis_vals) if basis_vals else None,
+        "basis_max": max(basis_vals) if basis_vals else None,
+        "basis_avg": sum(basis_vals) / len(basis_vals) if basis_vals else None,
+        "basis_last": basis_vals[-1] if basis_vals else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +574,427 @@ def build_bridge_tab(cgc_rows, statscan_rows):
                 dpg.add_text(b["note"][:60])
 
 
-def build_findings_tab(statscan_rows, cgc_rows):
+def build_prices_tab(price_rows):
+    dpg.add_text("PDQ Alberta canola spot cash bids & basis", color=COL_HDR)
+    dpg.add_text("Source: PDQ Info — spot month bids (units: CAD/bushel)", color=COL_DIM)
+    dpg.add_spacer(height=8)
+
+    if not price_rows:
+        coloured_text("No price data loaded. Run ingest/load_pdq.py.", COL_BAD)
+        return
+
+    by_zone = prices_by_zone(price_rows)
+    zone_order = ["Southern AB", "Northern AB", "Peace River"]
+    zone_colours = {"Southern AB": COL_SOUTH, "Northern AB": COL_NORTH, "Peace River": COL_PEACE}
+
+    # --- Summary cards ---
+    with dpg.collapsing_header(label="Zone summary", default_open=True):
+        with dpg.table(header_row=True, borders_innerH=True, borders_innerV=True,
+                       borders_outerH=True, borders_outerV=True, resizable=True,
+                       policy=dpg.mvTable_SizingStretchProp):
+            for h in ["Zone", "Days", "Date Range",
+                      "Cash Last", "Cash Avg", "Cash Min", "Cash Max",
+                      "Basis Last", "Basis Avg", "Basis Min", "Basis Max"]:
+                dpg.add_table_column(label=h)
+            for z in zone_order:
+                rows = by_zone.get(z, [])
+                if not rows:
+                    continue
+                s = price_summary_stats(rows)
+                with dpg.table_row():
+                    coloured_text(z, zone_colours.get(z, COL_INFO))
+                    dpg.add_text(str(s["n_days"]))
+                    dpg.add_text(f"{s['first']} to {s['last']}")
+                    dpg.add_text(fmt(s["cash_last"], 2))
+                    dpg.add_text(fmt(s["cash_avg"], 2))
+                    dpg.add_text(fmt(s["cash_min"], 2))
+                    dpg.add_text(fmt(s["cash_max"], 2))
+                    dpg.add_text(fmt(s["basis_last"], 2))
+                    dpg.add_text(fmt(s["basis_avg"], 2))
+                    dpg.add_text(fmt(s["basis_min"], 2))
+                    dpg.add_text(fmt(s["basis_max"], 2))
+
+    # --- Cash price plot (monthly avg, all zones) ---
+    with dpg.collapsing_header(label="Spot cash bids — monthly average (all zones)", default_open=True):
+        # Use sequential x indices for monthly averages, label with month strings
+        south_rows = by_zone.get("Southern AB", [])
+        north_rows = by_zone.get("Northern AB", [])
+        peace_rows = by_zone.get("Peace River", [])
+
+        s_labels, s_vals = monthly_avg(south_rows, "cash_per_bu")
+        n_labels, n_vals = monthly_avg(north_rows, "cash_per_bu")
+        p_labels, p_vals = monthly_avg(peace_rows, "cash_per_bu")
+
+        # Build unified x-axis from all labels
+        all_labels = sorted(set(s_labels + n_labels + p_labels))
+        if len(all_labels) >= 2:
+            x_map = {lbl: i for i, lbl in enumerate(all_labels)}
+            # Build tick labels (show every 6th month to avoid clutter)
+            tick_pairs = [(x_map[lbl], lbl) for lbl in all_labels[::6]]
+
+            with dpg.plot(height=300, width=-1):
+                dpg.add_plot_legend()
+                ax_x = dpg.add_plot_axis(dpg.mvXAxis, label="Month")
+                dpg.set_axis_limits(ax_x, -0.5, len(all_labels) - 0.5)
+                dpg.set_axis_ticks(ax_x, tuple(tick_pairs))
+                with dpg.plot_axis(dpg.mvYAxis, label="Cash (CAD/bu)"):
+                    if s_vals:
+                        dpg.add_line_series(
+                            [float(x_map[l]) for l in s_labels], s_vals,
+                            label="Southern AB")
+                    if n_vals:
+                        dpg.add_line_series(
+                            [float(x_map[l]) for l in n_labels], n_vals,
+                            label="Northern AB")
+                    if p_vals:
+                        dpg.add_line_series(
+                            [float(x_map[l]) for l in p_labels], p_vals,
+                            label="Peace River")
+
+    # --- Basis plot (monthly avg, all zones) ---
+    with dpg.collapsing_header(label="Basis — monthly average (all zones)", default_open=True):
+        s_labels_b, s_vals_b = monthly_avg(south_rows, "basis_per_bu")
+        n_labels_b, n_vals_b = monthly_avg(north_rows, "basis_per_bu")
+        p_labels_b, p_vals_b = monthly_avg(peace_rows, "basis_per_bu")
+
+        all_labels_b = sorted(set(s_labels_b + n_labels_b + p_labels_b))
+        if len(all_labels_b) >= 2:
+            x_map_b = {lbl: i for i, lbl in enumerate(all_labels_b)}
+            tick_pairs_b = [(x_map_b[lbl], lbl) for lbl in all_labels_b[::6]]
+
+            with dpg.plot(height=300, width=-1):
+                dpg.add_plot_legend()
+                ax_x_b = dpg.add_plot_axis(dpg.mvXAxis, label="Month")
+                dpg.set_axis_limits(ax_x_b, -0.5, len(all_labels_b) - 0.5)
+                dpg.set_axis_ticks(ax_x_b, tuple(tick_pairs_b))
+                with dpg.plot_axis(dpg.mvYAxis, label="Basis (CAD/bu)"):
+                    # Zero line reference
+                    dpg.add_line_series(
+                        [0.0, float(len(all_labels_b) - 1)], [0.0, 0.0],
+                        label="Zero")
+                    if s_vals_b:
+                        dpg.add_line_series(
+                            [float(x_map_b[l]) for l in s_labels_b], s_vals_b,
+                            label="Southern AB")
+                    if n_vals_b:
+                        dpg.add_line_series(
+                            [float(x_map_b[l]) for l in n_labels_b], n_vals_b,
+                            label="Northern AB")
+                    if p_vals_b:
+                        dpg.add_line_series(
+                            [float(x_map_b[l]) for l in p_labels_b], p_vals_b,
+                            label="Peace River")
+
+    # --- Southern AB basis by crop-year month (seasonal overlay) ---
+    with dpg.collapsing_header(label="Southern AB basis — seasonal pattern (by crop-year month)", default_open=True):
+        dpg.add_text(
+            "Each line = one crop year (Aug-Jul). X-axis = month within crop year.\n"
+            "This shows whether basis widens or tightens at different points in the marketing year.",
+            color=COL_INFO,
+        )
+        dpg.add_spacer(height=4)
+
+        # Group Southern AB by crop year
+        cy_basis = {}   # {crop_year: {month_offset: [values]}}
+        for r in south_rows:
+            if r["basis_per_bu"] is None:
+                continue
+            d = datetime.fromisoformat(r["observation_date"]).date()
+            if d.month >= 8:
+                cy = f"{d.year}/{(d.year + 1) % 100:02d}"
+                month_offset = d.month - 8   # Aug=0, Sep=1, ..., Dec=4
+            else:
+                cy = f"{d.year - 1}/{d.year % 100:02d}"
+                month_offset = d.month + 4   # Jan=5, Feb=6, ..., Jul=11
+            cy_basis.setdefault(cy, {}).setdefault(month_offset, []).append(r["basis_per_bu"])
+
+        if cy_basis:
+            month_labels = ["Aug", "Sep", "Oct", "Nov", "Dec",
+                            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul"]
+            tick_pairs_s = [(float(i), month_labels[i]) for i in range(12)]
+
+            with dpg.plot(height=300, width=-1):
+                dpg.add_plot_legend()
+                ax_x_s = dpg.add_plot_axis(dpg.mvXAxis, label="Crop year month")
+                dpg.set_axis_limits(ax_x_s, -0.5, 11.5)
+                dpg.set_axis_ticks(ax_x_s, tuple(tick_pairs_s))
+                with dpg.plot_axis(dpg.mvYAxis, label="Basis (CAD/bu)"):
+                    dpg.add_line_series([0.0, 11.0], [0.0, 0.0], label="Zero")
+                    for cy in sorted(cy_basis.keys()):
+                        months = cy_basis[cy]
+                        offsets = sorted(months.keys())
+                        # Only plot crop years with at least 4 months of data
+                        if len(offsets) < 4:
+                            continue
+                        x = [float(o) for o in offsets]
+                        y = [sum(months[o]) / len(months[o]) for o in offsets]
+                        dpg.add_line_series(x, y, label=cy)
+
+    # --- Recent daily table (last 30 rows, Southern AB) ---
+    with dpg.collapsing_header(label="Recent daily bids — Southern AB (last 30 days)", default_open=False):
+        recent = [r for r in south_rows if r["cash_per_bu"] is not None][-30:]
+        if recent:
+            with dpg.table(header_row=True, borders_innerH=True, borders_innerV=True,
+                           borders_outerH=True, borders_outerV=True, resizable=True,
+                           policy=dpg.mvTable_SizingStretchProp):
+                for h in ["Date", "Cash ($/bu)", "Chg", "Basis ($/bu)", "Basis Chg",
+                          "Futures"]:
+                    dpg.add_table_column(label=h)
+                for r in reversed(recent):  # newest first
+                    with dpg.table_row():
+                        dpg.add_text(r["observation_date"])
+                        dpg.add_text(fmt(r["cash_per_bu"], 2))
+                        chg = r.get("cash_change")
+                        if chg is not None:
+                            col = COL_GOOD if chg > 0 else COL_BAD if chg < 0 else COL_DIM
+                            coloured_text(f"{chg:+.2f}", col)
+                        else:
+                            dpg.add_text("-")
+                        dpg.add_text(fmt(r["basis_per_bu"], 2))
+                        bchg = r.get("basis_change")
+                        if bchg is not None:
+                            col = COL_GOOD if bchg > 0 else COL_BAD if bchg < 0 else COL_DIM
+                            coloured_text(f"{bchg:+.2f}", col)
+                        else:
+                            dpg.add_text("-")
+                        dpg.add_text(r.get("futures_contract") or "-")
+
+
+def match_basis_to_weeks(nowcast_rows, price_rows):
+    """For each nowcast week, find the nearest Southern AB basis observation.
+
+    Returns list of dicts with nowcast fields plus basis_per_bu and cash_per_bu.
+    Only includes rows where both on-farm stocks and basis are non-null.
+    """
+    # Build a date-indexed lookup for Southern AB prices
+    south_prices = {}
+    for r in price_rows:
+        if r["zone"] == "Southern AB" and r["basis_per_bu"] is not None:
+            south_prices[r["observation_date"]] = r
+
+    if not south_prices:
+        return []
+
+    price_dates = sorted(south_prices.keys())
+
+    def find_nearest(target_date):
+        """Find nearest price date within 5 days of target."""
+        # Binary-ish search: try exact, then ±1, ±2, etc.
+        for offset in range(6):
+            d = datetime.fromisoformat(target_date).date()
+            for sign in (0, -1, 1) if offset == 0 else (-1, 1):
+                candidate = (d + timedelta(days=offset * sign if offset else 0)).isoformat()
+                if candidate in south_prices:
+                    return south_prices[candidate]
+        return None
+
+    matched = []
+    for nw in nowcast_rows:
+        if nw["implied_on_farm_stocks_kt"] is None:
+            continue
+        price = find_nearest(nw["week_ending"])
+        if price is None:
+            continue
+        matched.append({
+            **nw,
+            "basis_per_bu": price["basis_per_bu"],
+            "cash_per_bu": price["cash_per_bu"],
+            "price_date": price["observation_date"],
+        })
+    return matched
+
+
+def build_nowcast_tab(nowcast_rows, price_rows):
+    dpg.add_text("Nowcast — implied on-farm stocks & basis signal", color=COL_HDR)
+    dpg.add_text(
+        "Stocks = Total Supplies − Cumulative Deliveries − Pro-rated Feed/Waste/Seed\n"
+        "On-Farm = Total Stocks − Visible Commercial Stocks (primary + process + condo)",
+        color=COL_DIM,
+    )
+    dpg.add_spacer(height=8)
+
+    if not nowcast_rows:
+        coloured_text("No nowcast data. Run nowcast.py after loading StatsCan + CGC data.", COL_BAD)
+        return
+
+    crop_years = sorted({r["crop_year"] for r in nowcast_rows})
+
+    # --- Time series: implied on-farm stocks ---
+    with dpg.collapsing_header(label="Implied on-farm stocks over time", default_open=True):
+        # Plot each crop year as a separate series on crop-year week axis
+        cy_data = {}
+        for r in nowcast_rows:
+            if r["implied_on_farm_stocks_kt"] is None:
+                continue
+            cy_data.setdefault(r["crop_year"], []).append(r)
+
+        if cy_data:
+            # Use sequential index (week of crop year derived from week_ending)
+            with dpg.plot(height=320, width=-1):
+                dpg.add_plot_legend()
+                dpg.add_plot_axis(dpg.mvXAxis, label="Week ending (sequential)")
+                with dpg.plot_axis(dpg.mvYAxis, label="Implied on-farm stocks (kt)"):
+                    for cy in sorted(cy_data.keys()):
+                        weeks = cy_data[cy]
+                        # x = ordinal offset from Aug 1 of the crop year start
+                        cy_start_year = int(cy[:4])
+                        aug1 = datetime(cy_start_year, 8, 1).date()
+                        x = [(datetime.fromisoformat(w["week_ending"]).date() - aug1).days / 7.0
+                             for w in weeks]
+                        y = [w["implied_on_farm_stocks_kt"] for w in weeks]
+                        dpg.add_line_series(x, y, label=cy)
+
+            dpg.add_text(
+                "X-axis = weeks since Aug 1 of crop year. Each line is one crop year.\n"
+                "Stocks decline through the year as deliveries accumulate.",
+                color=COL_DIM,
+            )
+
+    # --- Time series: estimated total stocks + visible + on-farm ---
+    with dpg.collapsing_header(label="Stock components — latest crop year", default_open=True):
+        latest_cy = sorted(cy_data.keys())[-1] if cy_data else None
+        if latest_cy:
+            weeks = cy_data[latest_cy]
+            cy_start_year = int(latest_cy[:4])
+            aug1 = datetime(cy_start_year, 8, 1).date()
+            x = [(datetime.fromisoformat(w["week_ending"]).date() - aug1).days / 7.0
+                 for w in weeks]
+            est_total = [w["estimated_total_stocks_kt"] for w in weeks]
+            visible = [w["visible_commercial_stocks_kt"] or 0 for w in weeks]
+            on_farm = [w["implied_on_farm_stocks_kt"] for w in weeks]
+
+            with dpg.plot(height=320, width=-1):
+                dpg.add_plot_legend()
+                dpg.add_plot_axis(dpg.mvXAxis, label=f"Weeks since Aug 1 ({latest_cy})")
+                with dpg.plot_axis(dpg.mvYAxis, label="Stocks (kt)"):
+                    dpg.add_line_series(x, est_total, label="Estimated Total")
+                    dpg.add_line_series(x, visible, label="Visible Commercial")
+                    dpg.add_line_series(x, on_farm, label="Implied On-Farm")
+
+    # --- THE SCATTER: on-farm stocks vs basis ---
+    matched = match_basis_to_weeks(nowcast_rows, price_rows)
+    with dpg.collapsing_header(label="SCATTER: implied on-farm stocks vs Southern AB basis", default_open=True):
+        if not matched:
+            coloured_text(
+                "Need both nowcast and PDQ price data for overlapping dates.\n"
+                "Run nowcast.py and ingest/load_pdq.py first.",
+                COL_WARN,
+            )
+        else:
+            dpg.add_text(
+                f"{len(matched)} week-observations with both stocks and basis data.\n"
+                "Hypothesis: more on-farm stocks → wider (more negative) basis.\n"
+                "If the cloud slopes down-left to up-right, the relationship holds.",
+                color=COL_INFO,
+            )
+            dpg.add_spacer(height=4)
+
+            x_farm = [m["implied_on_farm_stocks_kt"] for m in matched]
+            y_basis = [m["basis_per_bu"] for m in matched]
+
+            with dpg.plot(height=400, width=-1):
+                dpg.add_plot_legend()
+                dpg.add_plot_axis(dpg.mvXAxis, label="Implied on-farm stocks (kt)")
+                with dpg.plot_axis(dpg.mvYAxis, label="Southern AB basis (CAD/bu)"):
+                    # Scatter by crop year for colour coding
+                    cy_matched = {}
+                    for m in matched:
+                        cy_matched.setdefault(m["crop_year"], []).append(m)
+                    for cy in sorted(cy_matched.keys()):
+                        pts = cy_matched[cy]
+                        sx = [p["implied_on_farm_stocks_kt"] for p in pts]
+                        sy = [p["basis_per_bu"] for p in pts]
+                        dpg.add_scatter_series(sx, sy, label=cy)
+
+                    # Zero line
+                    dpg.add_line_series(
+                        [min(x_farm), max(x_farm)], [0.0, 0.0],
+                        label="Zero basis")
+
+            # Simple correlation
+            n = len(matched)
+            mean_x = sum(x_farm) / n
+            mean_y = sum(y_basis) / n
+            cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_farm, y_basis)) / n
+            var_x = sum((x - mean_x) ** 2 for x in x_farm) / n
+            var_y = sum((y - mean_y) ** 2 for y in y_basis) / n
+            if var_x > 0 and var_y > 0:
+                corr = cov / (var_x ** 0.5 * var_y ** 0.5)
+                dpg.add_spacer(height=4)
+                corr_color = COL_GOOD if abs(corr) > 0.3 else COL_WARN if abs(corr) > 0.15 else COL_DIM
+                coloured_text(f"Correlation: {corr:+.3f}  (n={n} weeks)", corr_color)
+                if corr < -0.15:
+                    dpg.add_text(
+                        "  Negative correlation = higher on-farm stocks associated with wider basis.\n"
+                        "  This is the expected direction — validates the supply-basis relationship.",
+                        color=COL_INFO,
+                    )
+                elif corr > 0.15:
+                    dpg.add_text(
+                        "  Positive correlation — unexpected. Could indicate confounding factors\n"
+                        "  (e.g. both stocks and basis driven by crop size or futures moves).\n"
+                        "  Worth investigating by crop year or seasonally detrending.",
+                        color=COL_WARN,
+                    )
+                else:
+                    dpg.add_text(
+                        "  Weak correlation — may need more data, seasonal adjustment,\n"
+                        "  or normalisation (stocks as % of supply) to see the signal.",
+                        color=COL_DIM,
+                    )
+
+    # --- Delivery pace vs basis (bonus signal from README) ---
+    with dpg.collapsing_header(label="Bonus: weekly delivery pace vs basis", default_open=False):
+        dpg.add_text(
+            "When deliveries accelerate while basis is wide, farmers are capitulating.\n"
+            "When deliveries slow while basis is tight, farmers are holding — bearish for basis.",
+            color=COL_INFO,
+        )
+        # This will be more useful once we have CGC delivery pace data
+        # alongside prices. For now, show what we have.
+        if not matched:
+            coloured_text("Need overlapping nowcast + price data.", COL_WARN)
+        else:
+            # Plot deliveries CYTD alongside basis for the latest crop year
+            latest = sorted(cy_matched.keys())[-1] if cy_matched else None
+            if latest and latest in cy_matched:
+                pts = cy_matched[latest]
+                cy_start_year = int(latest[:4])
+                aug1 = datetime(cy_start_year, 8, 1).date()
+                x_wk = [(datetime.fromisoformat(p["week_ending"]).date() - aug1).days / 7.0
+                         for p in pts]
+                y_del = [p["deliveries_cytd_kt"] for p in pts]
+                y_bas = [p["basis_per_bu"] for p in pts]
+
+                dpg.add_text(f"Crop year: {latest}", color=COL_HDR)
+                with dpg.plot(height=300, width=-1):
+                    dpg.add_plot_legend()
+                    dpg.add_plot_axis(dpg.mvXAxis, label="Weeks since Aug 1")
+                    with dpg.plot_axis(dpg.mvYAxis, label="Deliveries CYTD (kt)"):
+                        dpg.add_line_series(x_wk, y_del, label="Deliveries CYTD")
+                    with dpg.plot_axis(dpg.mvYAxis, label="Basis (CAD/bu)"):
+                        dpg.add_line_series(x_wk, y_bas, label="S.AB Basis")
+
+    # --- Data table ---
+    with dpg.collapsing_header(label="Nowcast data table", default_open=False):
+        with dpg.table(header_row=True, borders_innerH=True, borders_innerV=True,
+                       borders_outerH=True, borders_outerV=True, resizable=True,
+                       policy=dpg.mvTable_SizingStretchProp):
+            for h in ["Week Ending", "Crop Yr", "Supply", "Del CYTD",
+                      "Est Total", "Visible", "On-Farm"]:
+                dpg.add_table_column(label=h)
+            for r in nowcast_rows:
+                with dpg.table_row():
+                    dpg.add_text(r["week_ending"])
+                    dpg.add_text(r["crop_year"])
+                    dpg.add_text(fmt(r["total_supplies_kt"], 0))
+                    dpg.add_text(fmt(r["deliveries_cytd_kt"]))
+                    dpg.add_text(fmt(r["estimated_total_stocks_kt"]))
+                    dpg.add_text(fmt(r["visible_commercial_stocks_kt"]))
+                    dpg.add_text(fmt(r["implied_on_farm_stocks_kt"]))
+
+
+def build_findings_tab(statscan_rows, cgc_rows, price_rows, nowcast_rows):
     dpg.add_text("Project status & findings", color=COL_HDR)
     dpg.add_spacer(height=8)
 
@@ -485,6 +1008,20 @@ def build_findings_tab(statscan_rows, cgc_rows):
         n_combined = sum(1 for c in cgc_rows if c.get("notes") and "ombined" in (c["notes"] or ""))
         if n_combined:
             dpg.add_text(f"  Combined-week rows: {n_combined}  (CGC merged 2 weeks into 1 file)")
+    if price_rows:
+        zones = sorted({r["zone"] for r in price_rows})
+        date_range = f"{price_rows[0]['observation_date']} to {price_rows[-1]['observation_date']}"
+        dpg.add_text(f"  PDQ price rows:     {len(price_rows)} rows "
+                     f"({len(zones)} zones: {', '.join(zones)})")
+        dpg.add_text(f"                      {date_range}")
+    else:
+        dpg.add_text(f"  PDQ price rows:     0  (run ingest/load_pdq.py)")
+    if nowcast_rows:
+        nc_cys = sorted({r["crop_year"] for r in nowcast_rows})
+        dpg.add_text(f"  Nowcast rows:       {len(nowcast_rows)} rows "
+                     f"({len(nc_cys)} crop years: {', '.join(nc_cys)})")
+    else:
+        dpg.add_text(f"  Nowcast rows:       0  (run nowcast.py)")
     dpg.add_spacer(height=12)
 
     # Identity validation summary
@@ -519,6 +1056,22 @@ def build_findings_tab(statscan_rows, cgc_rows):
         dpg.add_text(f"  {len(early)} early weeks have no anchor yet (Aug-Dec, before first snapshot)")
     dpg.add_spacer(height=12)
 
+    # Price data health
+    if price_rows:
+        dpg.add_text("Price data health (PDQ)", color=COL_HDR)
+        by_zone = prices_by_zone(price_rows)
+        for z in sorted(by_zone.keys()):
+            s = price_summary_stats(by_zone[z])
+            no_basis = s["n_days"] - s["basis_n"]
+            dpg.add_text(f"  {z}: {s['n_days']} days, "
+                         f"cash ${s['cash_min']:.2f}-${s['cash_max']:.2f}/bu, "
+                         f"basis avg ${s['basis_avg']:.2f}/bu")
+            if no_basis > 0:
+                dpg.add_text(f"    ({no_basis} days missing basis — early dates before futures quoting)",
+                             color=COL_WARN if no_basis < 50 else COL_DIM)
+        coloured_text("  Price data loaded and healthy.", COL_GOOD)
+        dpg.add_spacer(height=12)
+
     # Why the gap is structural
     dpg.add_text("Why the bridge shows a consistent +7% gap", color=COL_HDR)
     dpg.add_text(
@@ -543,7 +1096,9 @@ def build_findings_tab(statscan_rows, cgc_rows):
         "     are unknown (set NULL).\n"
         "  3. Pre-first-anchor weeks (Aug-Dec, before the first StatsCan snapshot of a\n"
         "     new crop year) cannot be bridge-checked. This is fundamental.\n"
-        "  4. PDQ pricing not yet integrated — balance sheet first.",
+        "  4. PDQ pricing now loaded — next step is overlaying basis on the balance\n"
+        "  4. PDQ pricing loaded. Nowcast computes implied on-farm stocks.\n"
+        "     Scatter plot (Nowcast tab) shows the stocks-vs-basis relationship.",
         color=COL_DIM,
     )
     dpg.add_spacer(height=12)
@@ -551,14 +1106,14 @@ def build_findings_tab(statscan_rows, cgc_rows):
     # Next steps
     dpg.add_text("Next steps", color=COL_HDR)
     dpg.add_text(
-        "  - Load more crop years of CGC + matching StatsCan vintages to enable\n"
-        "    year-over-year delivery-pace comparisons (a model that doesn't need\n"
-        "    StatsCan anchors to validate weekly progress).\n"
-        "  - Build nowcast.py: apply the balance sheet identity weekly to compute\n"
-        "    implied AB on-farm stocks.\n"
+        "  - Load more crop years of CGC + matching StatsCan vintages to fill out\n"
+        "    the scatter with more data points.\n"
+        "  - Investigate whether normalising stocks (as % of total supply) or\n"
+        "    seasonally detrending improves the stocks-vs-basis correlation.\n"
         "  - Decide whether to close the +7% gap by adding the missing-channel tabs,\n"
         "    or accept it as a documented constant and apply a correction factor.\n"
-        "  - Add PDQ Southern AB cash bids once balance sheet feels solid.",
+        "  - Consider adding delivery-pace-vs-prior-year as a standalone signal\n"
+        "    (doesn't need StatsCan anchors, just multi-year CGC data).",
         color=COL_DIM,
     )
 
@@ -575,6 +1130,8 @@ def main():
 
     statscan_rows = fetch_statscan()
     cgc_rows = fetch_cgc()
+    price_rows = fetch_prices()
+    nowcast_rows = fetch_nowcast()
 
     dpg.create_context()
 
@@ -590,8 +1147,12 @@ def main():
                 build_weekly_tab(cgc_rows)
             with dpg.tab(label="Bridge Check"):
                 build_bridge_tab(cgc_rows, statscan_rows)
+            with dpg.tab(label="Prices (PDQ)"):
+                build_prices_tab(price_rows)
+            with dpg.tab(label="Nowcast"):
+                build_nowcast_tab(nowcast_rows, price_rows)
             with dpg.tab(label="Findings & Gaps"):
-                build_findings_tab(statscan_rows, cgc_rows)
+                build_findings_tab(statscan_rows, cgc_rows, price_rows, nowcast_rows)
 
     dpg.create_viewport(title="Alberta Canola S&D", width=1600, height=900)
     dpg.setup_dearpygui()

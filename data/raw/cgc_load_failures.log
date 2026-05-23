@@ -1,0 +1,8 @@
+CGC load failures - 2026-05-23T15:08:08.291572
+============================================================
+2017-2018/gsw-shg-22-en.xls
+  can't parse week number from title: 'Producer Deliveries to Primary Elevators - Weeks 21 & 22, December 18, 2017 - December 31, 2017'
+
+2024-2025/gsw-shg-52-en.xlsx
+  folder/file crop year mismatch: folder=2024/25, file title says 2024-07-31 = 2023/24
+
