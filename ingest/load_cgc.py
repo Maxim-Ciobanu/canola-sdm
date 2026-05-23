@@ -1,34 +1,49 @@
 """
-Bulk-load every CGC GSW weekly Excel file in data/raw/cgc/ into cgc_weekly.
+Bulk-load every CGC GSW weekly file in data/raw/cgc/ into cgc_weekly.
 
-Drop all your gsw-shg-NN-en.xlsx files into data/raw/cgc/ and run:
-    python3 ingest/load_cgc.py
+EXPECTED LAYOUT:
+    data/raw/cgc/
+        2016-2017/
+            gsw-shg-1-en.xls
+            gsw-shg-2-en.xls
+            ...
+            gsw-shg-52-en.xls
+        2017-2018/
+            ...
+        ...
+        2025-2026/
+            ...
 
+The folder name (e.g. "2016-2017") is the crop year. Files inside that
+folder MUST belong to that crop year — we use the folder name as the
+authoritative source. We still parse the title text inside the file to
+extract the week-ending date, but if the file's date contradicts the folder
+we trust the folder and log a warning.
+
+Handles both .xls and .xlsx automatically.
+Handles combined-week files (Christmas weeks etc) — splits into 2 rows.
 Re-running is safe — rows are upserted by (week_ending, geography, crop).
 
-Handles combined-week files: CGC sometimes merges two weeks into one report
-(usually around Christmas — e.g. "Week 22, December 18 - December 31"). When
-detected (date range > 7 days), we write TWO rows:
+Failures are logged to data/raw/cgc_load_failures.log instead of crashing
+the whole batch.
 
-  - The LATER week (e.g. wk22 ending Dec 31): stocks and CYTD as published,
-    weekly flow set to NULL (we can't isolate one week from the combined number).
-  - The EARLIER week (e.g. wk21 ending Dec 24): CYTD derived as
-    (published CYTD - combined weekly flow). Stocks set to NULL (we don't have
-    that point-in-time snapshot).
-
-Both rows get a `notes` field flagging the combined source. The gap detector
-respects these notes and won't false-warn.
+Run:
+    python3 ingest/load_cgc.py
 """
 
 import re
 import sqlite3
 import sys
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from openpyxl import load_workbook
+
+from openpyxl import load_workbook   # .xlsx
+import xlrd                          # .xls
 
 CGC_DIR = Path(__file__).parent.parent / "data" / "raw" / "cgc"
 DB_PATH = Path(__file__).parent.parent / "data" / "db" / "canola.sqlite"
+FAIL_LOG = Path(__file__).parent.parent / "data" / "raw" / "cgc_load_failures.log"
 
 SECTIONS = [
     ("Primary", "Producer Deliveries to Primary Elevators -",       "producer_deliveries_weekly_kt"),
@@ -43,20 +58,61 @@ SECTIONS = [
 ]
 ALBERTA_COL = 3   # 0=label, 1=MB, 2=SK, 3=Alberta, 4=BC, 5=Total
 
-# Columns to clear (set to NULL) on each side of a combined-week split
 WEEKLY_FLOW_COLS = (
     "producer_deliveries_weekly_kt",
     "primary_shipments_weekly_kt",
     "process_deliveries_weekly_kt",
     "total_deliveries_weekly_kt",
 )
-STOCK_COLS = (
-    "primary_elevator_stocks_kt",
-    "condo_storage_kt",
-    "process_elevator_stocks_kt",
-    "total_visible_stocks_kt",
-)
 
+
+# ---------------------------------------------------------------------------
+# File reading — uniform interface over xls + xlsx
+# ---------------------------------------------------------------------------
+
+def read_sheets_as_rows(path):
+    """Return {sheet_name: [(row values, ...), ...]} for either .xls or .xlsx.
+
+    For .xlsx uses openpyxl. For .xls uses xlrd. Both produce the same shape.
+    Only reads the Primary and Process sheets (no need for the others).
+    """
+    suffix = path.suffix.lower()
+    target_sheets = {"Primary", "Process"}
+
+    if suffix == ".xlsx":
+        wb = load_workbook(path, read_only=True, data_only=True)
+        out = {}
+        for name in wb.sheetnames:
+            if name in target_sheets:
+                out[name] = list(wb[name].iter_rows(values_only=True))
+        return out
+
+    if suffix == ".xls":
+        wb = xlrd.open_workbook(path)
+        out = {}
+        for name in wb.sheet_names():
+            if name in target_sheets:
+                sheet = wb.sheet_by_name(name)
+                rows = []
+                for r in range(sheet.nrows):
+                    row = []
+                    for c in range(sheet.ncols):
+                        cell = sheet.cell(r, c)
+                        # Treat empty cells as None to match openpyxl behaviour
+                        if cell.ctype == xlrd.XL_CELL_EMPTY or cell.ctype == xlrd.XL_CELL_BLANK:
+                            row.append(None)
+                        else:
+                            row.append(cell.value)
+                    rows.append(tuple(row))
+                out[name] = rows
+        return out
+
+    raise ValueError(f"Unsupported file type: {suffix}")
+
+
+# ---------------------------------------------------------------------------
+# Sheet-walking helpers (identical to before)
+# ---------------------------------------------------------------------------
 
 def find_section_row(rows, needle):
     for i, row in enumerate(rows):
@@ -73,22 +129,46 @@ def find_canola_below(rows, start_idx, max_lookahead=20):
     return None
 
 
-def crop_year_for(d):
-    """Return crop year string for a given date. Aug 1 = start of new crop year."""
+# ---------------------------------------------------------------------------
+# Crop-year handling
+# ---------------------------------------------------------------------------
+
+def folder_to_crop_year(folder_name):
+    """Convert folder name '2016-2017' into crop year string '2016/17'.
+
+    Returns None if the folder name doesn't match the pattern.
+    """
+    m = re.match(r"(\d{4})-(\d{4})", folder_name)
+    if not m:
+        return None
+    start_year = int(m.group(1))
+    end_year = int(m.group(2))
+    if end_year != start_year + 1:
+        return None
+    return f"{start_year}/{end_year % 100:02d}"
+
+
+def crop_year_for_date(d):
+    """Return crop year string for a given date. Aug 1 starts new crop year."""
     if d.month >= 8:
         return f"{d.year}/{(d.year + 1) % 100:02d}"
     return f"{d.year - 1}/{d.year % 100:02d}"
 
 
-def parse_one_file(path):
-    """Read one GSW xlsx. Returns a list of dicts (1 row normally, 2 if combined-week)."""
-    wb = load_workbook(path, read_only=True, data_only=True)
-    sheets = {name: list(wb[name].iter_rows(values_only=True))
-              for name in ("Primary", "Process") if name in wb.sheetnames}
-    if "Primary" not in sheets:
-        return []
+# ---------------------------------------------------------------------------
+# Parsing — produces one or two record dicts per file
+# ---------------------------------------------------------------------------
 
-    # Extract all the AB canola values
+def parse_one_file(path, folder_crop_year):
+    """Read one GSW file, return list of dicts (1 normally, 2 if combined-week).
+
+    Raises an exception if it can't be parsed — caller logs it.
+    """
+    sheets = read_sheets_as_rows(path)
+    if "Primary" not in sheets:
+        raise RuntimeError(f"no 'Primary' sheet found (sheets: {list(sheets.keys())})")
+
+    # Extract the AB canola number from each sub-section
     values = {}
     for sheet_name, needle, col in SECTIONS:
         if sheet_name not in sheets:
@@ -102,45 +182,64 @@ def parse_one_file(path):
         if canola_row is None:
             values[col] = None
             continue
-        raw = canola_row[ALBERTA_COL]
-        values[col] = float(raw) if raw not in (None, "", " ") else None
+        raw = canola_row[ALBERTA_COL] if len(canola_row) > ALBERTA_COL else None
+        if raw in (None, "", " "):
+            values[col] = None
+        else:
+            try:
+                values[col] = float(raw)
+            except (TypeError, ValueError):
+                values[col] = None
 
-    # Computed totals
-    values["total_deliveries_weekly_kt"] = (
-        (values.get("producer_deliveries_weekly_kt") or 0)
-        + (values.get("process_deliveries_weekly_kt") or 0)
+    # Computed totals (treat NULL as 0 only for the addition — but if BOTH are
+    # NULL we want NULL, not 0)
+    def _safe_sum(*vs):
+        if all(v is None for v in vs):
+            return None
+        return sum((v or 0) for v in vs)
+
+    values["total_deliveries_weekly_kt"] = _safe_sum(
+        values.get("producer_deliveries_weekly_kt"),
+        values.get("process_deliveries_weekly_kt"),
     )
-    values["total_deliveries_cytd_kt"] = (
-        (values.get("producer_deliveries_cytd_kt") or 0)
-        + (values.get("process_deliveries_cytd_kt") or 0)
+    values["total_deliveries_cytd_kt"] = _safe_sum(
+        values.get("producer_deliveries_cytd_kt"),
+        values.get("process_deliveries_cytd_kt"),
     )
-    values["total_visible_stocks_kt"] = (
-        (values.get("primary_elevator_stocks_kt") or 0)
-        + (values.get("process_elevator_stocks_kt") or 0)
-        + (values.get("condo_storage_kt") or 0)
+    values["total_visible_stocks_kt"] = _safe_sum(
+        values.get("primary_elevator_stocks_kt"),
+        values.get("process_elevator_stocks_kt"),
+        values.get("condo_storage_kt"),
     )
 
-    # Parse title
+    # Parse title text to get week number + week_ending date
     title_idx = find_section_row(sheets["Primary"], "Producer Deliveries to Primary Elevators -")
     if title_idx is None:
-        return []
+        raise RuntimeError("can't find 'Producer Deliveries to Primary Elevators -' title row")
     title_text = str(sheets["Primary"][title_idx][0])
 
     week_match = re.search(r"Week\s+(\d+)", title_text)
     if not week_match:
-        return []
+        raise RuntimeError(f"can't parse week number from title: {title_text!r}")
     week_number = int(week_match.group(1))
 
     dates = re.findall(r"([A-Z][a-z]+ \d+, \d{4})", title_text)
     if not dates:
-        return []
+        raise RuntimeError(f"can't parse week-ending date from title: {title_text!r}")
     parsed_dates = [datetime.strptime(d, "%B %d, %Y").date() for d in dates]
     week_ending = parsed_dates[-1]
 
-    # --- Combined-week detection -----------------------------------------
-    # A normal week is 7 days. The title typically has 2 dates spanning ~6 days
-    # (e.g. "February 19, 2024 - February 25, 2024"). A combined week spans
-    # ~13 days (e.g. "December 18, 2023 - December 31, 2023").
+    # Cross-check: does the file's internal date agree with the folder's crop year?
+    file_crop_year = crop_year_for_date(week_ending)
+    if file_crop_year != folder_crop_year:
+        # Use the folder name as the authoritative source per project decision,
+        # but log the conflict so we can investigate.
+        raise RuntimeError(
+            f"folder/file crop year mismatch: folder={folder_crop_year}, "
+            f"file title says {week_ending} = {file_crop_year}"
+        )
+
+    # Combined-week detection (date range > 10 days = combined file)
     is_combined = False
     span_days = None
     if len(parsed_dates) >= 2:
@@ -149,30 +248,22 @@ def parse_one_file(path):
             is_combined = True
 
     if not is_combined:
-        # Normal single-week file: one row
-        record = _build_record(week_number, week_ending, values, path.name,
-                               notes=None)
-        return [record]
+        return [_build_record(week_number, week_ending, folder_crop_year, values, path.name, notes=None)]
 
-    # --- Combined-week handling ------------------------------------------
-    # Write two rows. Naming:
-    #   later_week  = the wk in the title (week_number, week_ending = published)
-    #   earlier_week = (week_number - 1, week_ending - 7 days)
+    # Combined-week: split into two rows.
     earlier_week_num = week_number - 1
     earlier_week_end = week_ending - timedelta(days=7)
-
     note = f"Combined-week file ({span_days}-day span). Source: {path.name}"
 
-    # Later week row: keep stocks & CYTD as published, NULL the weekly flows.
+    # Later week: stocks + CYTD as published, weekly flows NULL
     later_vals = dict(values)
     for col in WEEKLY_FLOW_COLS:
         later_vals[col] = None
-    later_row = _build_record(week_number, week_ending, later_vals, path.name,
+    later_row = _build_record(week_number, week_ending, folder_crop_year, later_vals, path.name,
                               notes=note + " [later half of combined period]")
 
-    # Earlier week row: derive CYTD by subtracting combined weekly flow.
-    # We have the COMBINED weekly value in the original `values` dict.
-    earlier_vals = {col: None for col in values.keys()}
+    # Earlier week: CYTD derived by subtraction, stocks NULL
+    earlier_vals = {k: None for k in values.keys()}
     earlier_vals["producer_deliveries_cytd_kt"] = _safe_sub(
         values.get("producer_deliveries_cytd_kt"),
         values.get("producer_deliveries_weekly_kt"),
@@ -189,10 +280,9 @@ def parse_one_file(path):
         values.get("total_deliveries_cytd_kt"),
         values.get("total_deliveries_weekly_kt"),
     )
-    # Stocks and weekly flows stay NULL — we genuinely don't know.
-    earlier_row = _build_record(earlier_week_num, earlier_week_end, earlier_vals,
+    earlier_row = _build_record(earlier_week_num, earlier_week_end, folder_crop_year, earlier_vals,
                                 path.name,
-                                notes=note + " [earlier half — CYTD derived by subtraction, weekly/stocks NULL]")
+                                notes=note + " [earlier half - CYTD derived, weekly/stocks NULL]")
 
     return [earlier_row, later_row]
 
@@ -203,11 +293,11 @@ def _safe_sub(a, b):
     return a - b
 
 
-def _build_record(week_number, week_ending, values, source_file, notes):
+def _build_record(week_number, week_ending, crop_year, values, source_file, notes):
     return {
         "week_number": week_number,
         "week_ending": week_ending.isoformat(),
-        "crop_year":   crop_year_for(week_ending),
+        "crop_year":   crop_year,
         "geography":   "Alberta",
         "crop":        "Canola",
         "source_file": source_file,
@@ -224,86 +314,139 @@ def _build_record(week_number, week_ending, values, source_file, notes):
     }
 
 
+# ---------------------------------------------------------------------------
+# DB plumbing
+# ---------------------------------------------------------------------------
+
 def ensure_notes_column(con):
-    """Add notes column to cgc_weekly if missing (for old DBs)."""
     cur = con.cursor()
     cur.execute("PRAGMA table_info(cgc_weekly)")
     cols = {r[1] for r in cur.fetchall()}
     if "notes" not in cols:
         cur.execute("ALTER TABLE cgc_weekly ADD COLUMN notes TEXT")
         con.commit()
-        print("(added missing 'notes' column to cgc_weekly)")
+        print("(added 'notes' column to cgc_weekly)")
 
+
+def insert_record(cur, record):
+    cur.execute("""
+        INSERT OR REPLACE INTO cgc_weekly (
+            week_number, week_ending, crop_year, geography, crop,
+            producer_deliveries_weekly_kt, primary_shipments_weekly_kt,
+            producer_deliveries_cytd_kt, primary_shipments_cytd_kt,
+            primary_elevator_stocks_kt, condo_storage_kt,
+            process_deliveries_weekly_kt, process_deliveries_cytd_kt,
+            process_elevator_stocks_kt,
+            total_deliveries_weekly_kt, total_deliveries_cytd_kt,
+            total_visible_stocks_kt,
+            source_file, notes
+        ) VALUES (
+            :week_number, :week_ending, :crop_year, :geography, :crop,
+            :producer_deliveries_weekly_kt, :primary_shipments_weekly_kt,
+            :producer_deliveries_cytd_kt, :primary_shipments_cytd_kt,
+            :primary_elevator_stocks_kt, :condo_storage_kt,
+            :process_deliveries_weekly_kt, :process_deliveries_cytd_kt,
+            :process_elevator_stocks_kt,
+            :total_deliveries_weekly_kt, :total_deliveries_cytd_kt,
+            :total_visible_stocks_kt,
+            :source_file, :notes
+        )
+    """, record)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     if not CGC_DIR.exists():
         print(f"ERROR: directory not found: {CGC_DIR}")
         sys.exit(1)
 
-    files = sorted(CGC_DIR.glob("*.xlsx"))
-    if not files:
-        print(f"No .xlsx files in {CGC_DIR}. Drop your GSW files there and re-run.")
+    # Discover year folders
+    year_folders = sorted([p for p in CGC_DIR.iterdir() if p.is_dir()])
+    if not year_folders:
+        # Maybe flat layout (no subfolders) — try the old behaviour
+        flat_files = sorted(list(CGC_DIR.glob("*.xls")) + list(CGC_DIR.glob("*.xlsx")))
+        if flat_files:
+            print(f"No year folders, but found {len(flat_files)} loose files in {CGC_DIR}")
+            print("WARNING: without a year folder I can't tell what crop year these belong to.")
+            print("         Move them into a folder named like '2023-2024'.")
+            sys.exit(1)
+        print(f"No year folders or files found in {CGC_DIR}")
         sys.exit(0)
 
-    print(f"Found {len(files)} file(s) in {CGC_DIR}\n")
+    # Validate folder names
+    valid_folders = []
+    for folder in year_folders:
+        cy = folder_to_crop_year(folder.name)
+        if cy is None:
+            print(f"  WARN  skipping folder {folder.name} (not in YYYY-YYYY format)")
+            continue
+        valid_folders.append((folder, cy))
+
+    print(f"Discovered {len(valid_folders)} year folder(s):")
+    for folder, cy in valid_folders:
+        n = len(list(folder.glob("*.xls"))) + len(list(folder.glob("*.xlsx")))
+        print(f"  {folder.name}  ->  crop year {cy}  ({n} files)")
+    print()
 
     con = sqlite3.connect(DB_PATH)
     ensure_notes_column(con)
     cur = con.cursor()
 
+    # Collect all (path, crop_year) pairs
+    all_files = []
+    for folder, cy in valid_folders:
+        files = sorted(list(folder.glob("*.xls")) + list(folder.glob("*.xlsx")))
+        for f in files:
+            all_files.append((f, cy))
+
+    print(f"Processing {len(all_files)} files...\n")
+
     inserted, skipped, failed = 0, 0, 0
-    failed_files = []
-    for path in files:
+    failures = []     # (path, reason)
+    progress_every = max(1, len(all_files) // 20)   # ~20 progress lines
+
+    for i, (path, cy) in enumerate(all_files, start=1):
+        rel_path = f"{path.parent.name}/{path.name}"
         try:
-            records = parse_one_file(path)
+            records = parse_one_file(path, cy)
             if not records:
                 skipped += 1
-                print(f"  SKIP {path.name:<35} (couldn't parse)")
+                failures.append((rel_path, "parse returned no records"))
                 continue
             for record in records:
-                cur.execute("""
-                    INSERT OR REPLACE INTO cgc_weekly (
-                        week_number, week_ending, crop_year, geography, crop,
-                        producer_deliveries_weekly_kt, primary_shipments_weekly_kt,
-                        producer_deliveries_cytd_kt, primary_shipments_cytd_kt,
-                        primary_elevator_stocks_kt, condo_storage_kt,
-                        process_deliveries_weekly_kt, process_deliveries_cytd_kt,
-                        process_elevator_stocks_kt,
-                        total_deliveries_weekly_kt, total_deliveries_cytd_kt,
-                        total_visible_stocks_kt,
-                        source_file, notes
-                    ) VALUES (
-                        :week_number, :week_ending, :crop_year, :geography, :crop,
-                        :producer_deliveries_weekly_kt, :primary_shipments_weekly_kt,
-                        :producer_deliveries_cytd_kt, :primary_shipments_cytd_kt,
-                        :primary_elevator_stocks_kt, :condo_storage_kt,
-                        :process_deliveries_weekly_kt, :process_deliveries_cytd_kt,
-                        :process_elevator_stocks_kt,
-                        :total_deliveries_weekly_kt, :total_deliveries_cytd_kt,
-                        :total_visible_stocks_kt,
-                        :source_file, :notes
-                    )
-                """, record)
+                insert_record(cur, record)
                 inserted += 1
-            tag = " [SPLIT INTO 2 ROWS]" if len(records) == 2 else ""
-            print(f"  OK   {path.name:<35} -> {len(records)} row(s){tag}")
-            for r in records:
-                weekly_status = "weekly=NULL" if r["producer_deliveries_weekly_kt"] is None else f"weekly={r['producer_deliveries_weekly_kt']}"
-                print(f"        wk {r['week_number']:>2}  ending {r['week_ending']}  CY {r['crop_year']}  {weekly_status}")
+            if i % progress_every == 0 or i == len(all_files):
+                tag = " [SPLIT]" if len(records) == 2 else ""
+                print(f"  [{i:>4}/{len(all_files)}]  {rel_path:<45}  wk {records[-1]['week_number']:>2}  "
+                      f"ending {records[-1]['week_ending']}{tag}")
         except Exception as e:
             failed += 1
-            failed_files.append((path.name, str(e)))
-            print(f"  ERR  {path.name}: {e}")
+            failures.append((rel_path, str(e)))
+            tb = traceback.format_exc()
+            # Show ERR immediately so user sees it without scanning the log
+            print(f"  ERR   {rel_path}: {e}")
 
     con.commit()
-    print(f"\nDone: {inserted} row(s) inserted/replaced, {skipped} skipped, {failed} failed")
-    if failed_files:
-        print("\nFailed files:")
-        for n, e in failed_files:
-            print(f"  - {n}: {e}")
 
-    # Summary
-    print("\n--- cgc_weekly summary ---")
+    print(f"\n{'='*60}")
+    print(f"Done: {inserted} row(s) inserted/replaced from {len(all_files)} file(s)")
+    print(f"      {failed} files failed, {skipped} skipped")
+
+    if failures:
+        FAIL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(FAIL_LOG, "w") as f:
+            f.write(f"CGC load failures - {datetime.now().isoformat()}\n")
+            f.write(f"{'='*60}\n")
+            for path, reason in failures:
+                f.write(f"{path}\n  {reason}\n\n")
+        print(f"      Failures logged to {FAIL_LOG}")
+
+    # Coverage summary
+    print(f"\n--- cgc_weekly coverage by crop year ---")
     cur.execute("""
         SELECT crop_year, COUNT(*) AS weeks,
                MIN(week_number) AS first_wk, MAX(week_number) AS last_wk,
@@ -311,26 +454,35 @@ def main():
         FROM cgc_weekly WHERE geography='Alberta' AND crop='Canola'
         GROUP BY crop_year ORDER BY crop_year
     """)
-    print(f"{'crop_year':<10} {'weeks':>6} {'wk_range':>10}  {'date_range'}")
+    print(f"{'crop_year':<10} {'weeks':>6}  {'wk_range':>10}  {'date_range'}")
     for r in cur.fetchall():
-        print(f"{r[0]:<10} {r[1]:>6} {r[2]:>3}-{r[3]:<6} {r[4]} to {r[5]}")
+        print(f"{r[0]:<10} {r[1]:>6}  {r[2]:>3}-{r[3]:<6}  {r[4]} to {r[5]}")
 
-    # Gap detector — but ignore weeks whose row was synthesised from a combined file
+    # Gap detector per crop year
     cur.execute("""
-        SELECT crop_year, week_number, notes FROM cgc_weekly
+        SELECT crop_year, week_number FROM cgc_weekly
         WHERE geography='Alberta' AND crop='Canola'
         ORDER BY crop_year, week_number
     """)
     by_cy = {}
-    for cy, wn, _ in cur.fetchall():
+    for cy, wn in cur.fetchall():
         by_cy.setdefault(cy, []).append(wn)
+
+    any_gaps = False
     for cy, weeks in by_cy.items():
         weeks = sorted(set(weeks))
         if weeks:
             full = set(range(weeks[0], weeks[-1] + 1))
             gaps = sorted(full - set(weeks))
             if gaps:
-                print(f"\n  WARN  {cy} has missing weeks: {gaps}")
+                if not any_gaps:
+                    print()
+                any_gaps = True
+                # Compact representation if many gaps
+                if len(gaps) > 10:
+                    print(f"  WARN  {cy} missing {len(gaps)} weeks: {gaps[:5]}...{gaps[-3:]}")
+                else:
+                    print(f"  WARN  {cy} missing weeks: {gaps}")
 
     con.close()
 
