@@ -14,8 +14,8 @@ Statistics Canada publishes an Alberta canola balance sheet three times a year. 
 
 | # | Source | What it gives us | Frequency |
 |---|---|---|---|
-| 1 | [StatsCan 32-10-0017](https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=3210001701) (Alberta filter) | Full AB balance sheet: beginning stocks, production, deliveries, ending stocks, feed/waste | Triannual (Dec/Mar/Jul) |
-| 2 | [CGC GSW](https://www.grainscanada.gc.ca/en/grain-research/statistics/grain-statistics-weekly/) (Alberta tab) | Weekly + CYTD producer deliveries, primary elevator stocks, condo storage | Weekly |
+| 1 | [StatsCan](https://www150.statcan.gc.ca/t1/tbl1/en/cv.action?pid=3210001501) (Alberta filter) | Full AB balance sheet: beginning stocks, production, deliveries, ending stocks, feed/waste | Triannual (Dec/Mar/Jul) |
+| 2 | [CGC GSW](https://www.grainscanada.gc.ca/en/grain-research/statistics/grain-statistics-weekly/archived.html#wb-auto-5) (Alberta tab) | Weekly + CYTD producer deliveries, primary elevator stocks, condo storage | Weekly |
 | 3 | [PDQ Alberta Grains](https://www.pdqinfo.ca/) | Southern AB spot cash bids | Daily |
 
 That is the entire data layer. Other sources (AAFC, AB crop reports, ICE futures, etc.) are explicitly not in scope until the base model works.

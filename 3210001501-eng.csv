@@ -1,0 +1,37 @@
+﻿"Farm supply and disposition of grains (x 1,000) 1 2"
+"Frequency: Occasional Monthly"
+"Table: 32-10-0015-01 (formerly CANSIM 001-0043)"
+"Release date: 2026-05-06"
+"Geography: Canada, Geographical region of Canada, Province or territory"
+""
+""
+
+,"Geography","Alberta",,,,,
+"Type of crop","Farm supply and disposition of grains","March 2023","July 2023","December 2023","March 2024","July 2024","December 2024"
+"Canola 3 4 5",,"Metric tonnes",,,,,
+,"Total supplies","5,739.7","5,739.7","5,921.1","5,921.1","5,921.1","6,016.9"
+,"Beginning stocks","148.0","148.0","208.0","208.0","208.0","418.0"
+,"Production","5,591.7","5,591.7","5,713.1","5,713.1","5,713.1","5,598.9"
+,"Total disposition","5,739.7","5,739.7","5,921.1","5,921.1","5,921.1","6,016.9"
+,"Deliveries 3 6 7","3,973.4","5,400.1","2,054.7","3,462.2","5,480.5","2,529.1"
+,"Seed requirements","0.0","18.6","0.0","0.0","18.6","0.0"
+,"Ending stocks 8","1,764.0","208.0","3,865.0","2,456.0","418.0","3,430.0"
+,"Animal feed, waste and dockage","2.3","113.1","1.4","2.9","4.0","57.7"
+
+
+
+
+Footnotes:
+1,"All grains except soybeans are based on the crop year August to July. The data for the periods are cumulative over the crop year (March 20XX = August to March; July 20XX = August to July; and December 20XX = August to December)."
+2,"Soybeans are based on the crop year September to August. The data for the periods are cumulative over the crop year (March 20XX = September to March; July 20XX = September to August; and December 20XX = September to December)."
+3,"Includes only licensed canola deliveries in Ontario."
+4,"Animal feed, waste and dockage calculated residually."
+5,"Historical data may include some rapeseed."
+6,"Excludes flaxseed deliveries to process elevators."
+7,"Data in this table are updated three times a year. For the most updated data on grain deliveries, see table 32-10-0351."
+8,"Also known as carryover."
+
+
+
+"How to cite: Statistics Canada. Table 32-10-0015-01  Farm supply and disposition of grains (x 1,000)"
+https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=3210001501
